@@ -11,10 +11,6 @@ A stalled write can no longer starve reads of connections.
 
 ## Build
 
-Requirements: JDK 17+ (clearance uses 25) and sbt 1.10.x.
-`project/build.properties` pins sbt 1.10.11 to match clearance. The default `java` on some machines is 1.8,
-which sbt will not start on, so set `JAVA_HOME` first.
-
 ```bash
 export JAVA_HOME=~/.sdkman/candidates/java/25.0.3-tem
 sbt test          # compiles (Scala 2.13.18) and runs the pending test skeletons
@@ -72,7 +68,7 @@ Then point read-only DAOs at `readDb` and leave everything else on `db`.
 | Observability | `PoolMetricsRegistry.register` / `verifyRegistered` / `snapshot`, `PoolMetrics` |
 | Optional job pool | `DatabaseRole.Background`, `backgroundDb` (`jobDb` section) |
 
-`executorDecorator` lets a service wrap each executor, for example clearance's `MdcAsyncExecutor`.
+`executorDecorator` lets a service wrap each executor.
 
 ## Tests to implement (proposal sections 5.5 and 7.2)
 

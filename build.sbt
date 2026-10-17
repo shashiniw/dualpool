@@ -1,7 +1,6 @@
 ThisBuild / organization := "com.lab" // ignored on machines whose global.sbt sets organization; see projectID below
 ThisBuild / version := "0.1.0-SNAPSHOT"
 
-// Clearance are on Scala 2.13, so cross-build for both.
 val scala213 = "2.13.18"
 val scala3 = "3.3.8"
 

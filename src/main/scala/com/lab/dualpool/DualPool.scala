@@ -39,7 +39,7 @@ object DualPool {
    * AsyncExecutor per pool, and registers per-pool metrics eagerly. Lifecycle is explicit: nothing is created
    * until this is called, and the caller closes the result with the service (proposal §4.2 "Lifecycle").
    *
-   * @param executorDecorator wraps each pool's executor, e.g. to propagate MDC as clearance's MdcAsyncExecutor does
+   * @param executorDecorator wraps each pool's executor
    */
   def apply(profile: JdbcProfile,
             config: DualPoolConfig,
