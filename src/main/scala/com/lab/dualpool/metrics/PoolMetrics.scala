@@ -10,7 +10,35 @@ final case class PoolMetrics(poolName: String,
                              connectionWaitMillisP95: Long)
 
 object PoolMetrics {
-  /** The stable metric names each pool registers under `<poolName>.<metric>`; used by the contract test. */
-  val MetricNames: Seq[String] =
-    Seq("active", "idle", "pending", "total", "queueDepth", "connectionWaitMillis")
+
+  /**
+   * The metric names every pool must expose, each carrying a `pool` label. The first six come from HikariCP's
+   * own Prometheus exporter; `slick_executor_queue_size` is the library's, and is the one to alert on (§5.5).
+   *
+   * The contract test asserts that every pool publishes every one of these under its own `pool` label, including
+   * a pool that has not yet served a query.
+   */
+  val MetricNames: Seq[String] = Seq(
+    "hikaricp_active_connections",
+    "hikaricp_idle_connections",
+    "hikaricp_pending_threads",
+    "hikaricp_connections",
+    "hikaricp_connection_acquired_nanos",
+    "hikaricp_connection_timeout_total",
+    "slick_executor_queue_size"
+  )
+
+  /** Value used when a reading is not available, rather than a zero that would read as healthy. */
+  val Unavailable: Int = -1
+
+  def from(stats: PoolStatsSource, connectionWaitMillisP95: Long): PoolMetrics =
+    PoolMetrics(
+      poolName = stats.poolName,
+      activeConnections = stats.activeConnections,
+      idleConnections = stats.idleConnections,
+      pendingConnections = stats.pendingConnections,
+      totalConnections = stats.totalConnections,
+      executorQueueDepth = stats.executorQueueDepth,
+      connectionWaitMillisP95 = connectionWaitMillisP95
+    )
 }

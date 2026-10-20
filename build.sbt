@@ -19,6 +19,9 @@ lazy val root = (project in file("."))
       "com.zaxxer" % "HikariCP" % "7.1.0" exclude("org.slf4j", "slf4j-api"),
       "com.typesafe" % "config" % "1.4.9",
       "org.slf4j" % "slf4j-api" % "2.0.17",
+      // Provided: a service that has no metrics stack still gets the pools, just without the exporter
+      // (PoolMetricsRegistry.default falls back to a no-op). Provided is on the test classpath too.
+      "io.prometheus" % "simpleclient" % "0.16.0" % Provided,
       "org.scalatest" %% "scalatest" % "3.2.19" % Test,
       "org.hsqldb" % "hsqldb" % "2.7.4" % Test
     )
