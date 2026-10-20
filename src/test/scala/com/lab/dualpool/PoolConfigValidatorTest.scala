@@ -31,8 +31,8 @@ class PoolConfigValidatorTest extends AnyFunSuite with Matchers {
   }
 
   test("an adopted pool is warned about rather than refused, so adoption is not blocked by existing wiring") {
-    // clearance-service runs a 20-thread executor against a 6-connection Hikari pool today. The library has to
-    // report that without refusing to start, because it did not build that pool and cannot fix it.
+    // A service may run a 20-thread executor against a 6-connection Hikari pool. The library has to report that
+    // without refusing to start, because it did not build that pool and cannot fix it.
     val config = DualPoolConfig(pool("write", threads = 20, connections = 6, adopted = true), Some(pool("read")), None)
     val problems = PoolConfigValidator.validate(config)
 

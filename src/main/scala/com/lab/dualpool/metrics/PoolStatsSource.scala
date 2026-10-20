@@ -27,6 +27,9 @@ trait PoolStatsSource {
   def executorQueueCapacity: Int
 
   def executorActiveThreads: Int
+
+  /** The executor's thread count, so an adopted pool's threads can be checked against its connections. */
+  def executorMaxThreads: Int
 }
 
 object PoolStatsSource {
@@ -65,6 +68,7 @@ object PoolStatsSource {
     def executorQueueDepth: Int = executor(_.getQueueSize)
     def executorQueueCapacity: Int = executor(_.getMaxQueueSize)
     def executorActiveThreads: Int = executor(_.getActiveThreads)
+    def executorMaxThreads: Int = executor(_.getMaxThreads)
 
     private def hikari(read: com.zaxxer.hikari.HikariPoolMXBean => Int): Int =
       try {
@@ -100,7 +104,8 @@ object PoolStatsSource {
             total: Int = 0,
             queueDepth: Int = 0,
             queueCapacity: Int = 0,
-            activeThreads: Int = 0): PoolStatsSource = new PoolStatsSource {
+            activeThreads: Int = 0,
+            maxThreads: Int = 0): PoolStatsSource = new PoolStatsSource {
     val poolName: String = name
     val activeConnections: Int = active
     val idleConnections: Int = idle
@@ -109,5 +114,6 @@ object PoolStatsSource {
     val executorQueueDepth: Int = queueDepth
     val executorQueueCapacity: Int = queueCapacity
     val executorActiveThreads: Int = activeThreads
+    val executorMaxThreads: Int = maxThreads
   }
 }

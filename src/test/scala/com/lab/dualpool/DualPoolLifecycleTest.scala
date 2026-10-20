@@ -1,6 +1,6 @@
 package com.lab.dualpool
 
-import com.lab.dualpool.config.DualPoolConfig
+import com.lab.dualpool.config.{DualPoolConfig, PoolConfigValidator}
 import com.lab.dualpool.metrics.{PoolStatsSource, PrometheusPoolMetricsRegistry}
 import com.typesafe.config.ConfigFactory
 import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
@@ -57,7 +57,7 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
     val name = databaseName("adopt")
     val registry = new CollectorRegistry()
 
-    // Stand in for what a service like clearance already owns: its own Hikari pool and Slick executor.
+    // Stand in for what an existing service already owns: its own Hikari pool and Slick executor.
     val hikariConfig = new HikariConfig()
     hikariConfig.setPoolName("adopted-write")
     hikariConfig.setJdbcUrl(s"jdbc:hsqldb:mem:$name")
@@ -156,7 +156,7 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
   }
 
   test("an adopted pool built with setters still reports, because the library starts it") {
-    // Reproduces how clearance-service builds its write pool: `new HikariDataSource()` plus setters, which does
+    // A service may build its write pool as `new HikariDataSource()` plus setters, which does
     // not start the pool until the first getConnection. HikariCP registers a pool with its Prometheus exporter
     // only when the pool starts, so before the library warmed it up this combination failed the service start
     // with "pool metrics are not fully registered".
@@ -196,6 +196,57 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
         pool.metricsSnapshot(DatabaseRole.Write).totalConnections should be > 0
         pool.metricsSnapshot(DatabaseRole.Read).poolName shouldBe "lazy-adopted-read"
       } finally pool.close()
+    } finally {
+      existingDb.close()
+      existingDataSource.close()
+    }
+  }
+
+  test("an adopted pool is checked as the service built it, not as its config describes it") {
+    // `db.maxPoolSize = 6` implies 6 threads, but the executor is sized in code with 20 threads and a 1000 queue.
+    // The mismatch is a warning, so the service still starts.
+    val name = databaseName("actual-sizing")
+    val existingDataSource = new HikariDataSource()
+    existingDataSource.setPoolName("actual-sizing-write")
+    existingDataSource.setJdbcUrl(s"jdbc:hsqldb:mem:$name")
+    existingDataSource.setMaximumPoolSize(6)
+    val existingExecutor = AsyncExecutor("actual-sizing-executor", 20, 20, 1000, 20, registerMbeans = true)
+    val existingDb: JdbcBackend#Database = JdbcBackend.Database.forDataSource(existingDataSource, None, existingExecutor)
+
+    try {
+      val configuration = DualPoolConfig.load(ConfigFactory.parseString(
+        s"""db { url = "jdbc:hsqldb:mem:$name", maxPoolSize = 6 }"""))
+
+      val write = DualPool.adoptedWriteConfig(
+        configuration.write, existingDb, Some(existingDataSource), Some("actual-sizing-executor"))
+
+      (write.maxConnections, write.numThreads, write.queueSize) shouldBe ((6, 20, 1000))
+      PoolConfigValidator.validate(configuration.copy(write = write)) shouldBe Seq(PoolConfigValidator.Warning(
+        "db (pool 'actual-sizing-write'): numThreads (20) != maxConnections (6); surplus threads block inside " +
+          "Slick waiting for a connection, which hides saturation from the queue metric"))
+    } finally {
+      existingDb.close()
+      existingDataSource.close()
+    }
+  }
+
+  test("an adopted executor without MBeans cannot be checked, so it is not reported as mismatched") {
+    val name = databaseName("no-mbeans")
+    val existingDataSource = new HikariDataSource()
+    existingDataSource.setJdbcUrl(s"jdbc:hsqldb:mem:$name")
+    existingDataSource.setMaximumPoolSize(4)
+    val existingExecutor = AsyncExecutor("no-mbeans-executor", 20, 20, 1000, 20, registerMbeans = false)
+    val existingDb: JdbcBackend#Database = JdbcBackend.Database.forDataSource(existingDataSource, None, existingExecutor)
+
+    try {
+      val configuration = DualPoolConfig.load(ConfigFactory.parseString(
+        s"""db { url = "jdbc:hsqldb:mem:$name", maxPoolSize = 4 }"""))
+
+      val write = DualPool.adoptedWriteConfig(
+        configuration.write, existingDb, Some(existingDataSource), Some("no-mbeans-executor"))
+
+      (write.maxConnections, write.numThreads, write.queueSize) shouldBe ((4, 4, configuration.write.queueSize))
+      PoolConfigValidator.validate(configuration.copy(write = write)) shouldBe empty
     } finally {
       existingDb.close()
       existingDataSource.close()

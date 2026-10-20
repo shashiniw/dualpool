@@ -8,6 +8,7 @@ import slick.jdbc.{JdbcBackend, JdbcProfile}
 import slick.util.AsyncExecutor
 
 import java.util.concurrent.atomic.AtomicBoolean
+import scala.util.Try
 
 /**
  * Entry point of the library: independent Slick databases per workload, each with its own HikariCP pool,
@@ -76,10 +77,8 @@ object DualPool {
                         adoptedWriteDataSource: Option[HikariDataSource] = None,
                         adoptedWriteExecutorName: Option[String] = None,
                         metricsRegistry: PoolMetricsRegistry = PoolMetricsRegistry.default): DualPool = {
-    val adoptedConfig = config.copy(write = config.write.copy(
-      // Report the pool under the name it actually carries, not the one the config guessed at.
-      name = adoptedWriteDataSource.map(_.getPoolName).filter(_ != null).getOrElse(config.write.name),
-      adopted = true))
+    val adoptedConfig = config.copy(write =
+      adoptedWriteConfig(config.write, existingWriteDb, adoptedWriteDataSource, adoptedWriteExecutorName))
 
     PoolConfigValidator.validateOrFail(adoptedConfig, adoptedConfig.instances, adoptedConfig.databaseConnectionLimit)
 
@@ -138,6 +137,26 @@ object DualPool {
             s"dualpool: could not build the ${role.defaultPoolName} pool '${poolConfig.name}': ${e.getMessage}", e)
       }
     }
+
+  /**
+   * Replaces the adopted pool's configured sizes with the real ones read from the running pool, so validation
+   * checks what was actually built. Threads fall back to connections when the executor has no MBean.
+   */
+  private[dualpool] def adoptedWriteConfig(configured: PoolConfig,
+                                           existingWriteDb: JdbcBackend#Database,
+                                           dataSource: Option[HikariDataSource],
+                                           executorName: Option[String]): PoolConfig = {
+    Try(existingWriteDb.executor.executionContext) // Slick registers the executor MBean on first use
+    val stats = dataSource.map(PoolStatsSource(_, executorName.getOrElse(configured.name)))
+    val maxConnections = dataSource.map(_.getMaximumPoolSize).getOrElse(configured.maxConnections)
+    configured.copy(
+      // Report the pool under the name it actually carries, not the one the config guessed at.
+      name = dataSource.map(_.getPoolName).filter(_ != null).getOrElse(configured.name),
+      maxConnections = maxConnections,
+      numThreads = stats.map(_.executorMaxThreads).filter(_ > 0).getOrElse(maxConnections),
+      queueSize = stats.map(_.executorQueueCapacity).filter(_ > 0).getOrElse(configured.queueSize),
+      adopted = true)
+  }
 
   /**
    * Starts an adopted HikariCP pool so it publishes.
