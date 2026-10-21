@@ -289,6 +289,10 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
         withClue("a bounded queue must reject once it is full rather than growing without limit: ") {
           rejected shouldBe true
         }
+
+        val failed = flood.count(_.value.exists(_.isFailure))
+        CollectorRegistry.defaultRegistry.getSampleValue(
+          "slick_executor_rejected_total", Array("pool"), Array("overload-read")) shouldBe failed.toDouble
       } finally {
         release.countDown()
         scala.util.Try(await(blocker))

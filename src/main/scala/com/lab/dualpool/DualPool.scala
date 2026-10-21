@@ -7,7 +7,7 @@ import org.slf4j.LoggerFactory
 import slick.jdbc.{JdbcBackend, JdbcProfile}
 import slick.util.AsyncExecutor
 
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.{AtomicBoolean, LongAdder}
 import scala.util.Try
 
 /**
@@ -125,10 +125,11 @@ object DualPool {
     pools.foldLeft(initial) { case (built, (role, poolConfig)) =>
       try {
         val dataSource = PoolFactory.hikari(poolConfig, metricsRegistry.metricsTrackerFactory)
-        val executor = PoolFactory.executor(poolConfig, executorDecorator)
+        val rejections = new LongAdder
+        val executor = PoolFactory.executor(poolConfig, executorDecorator, rejections)
         val database = PoolFactory.database(dataSource, executor, poolConfig)
         built + (role -> PoolHandle(role, poolConfig, Some(dataSource), Some(executor), database,
-          owned = true, executorName = poolConfig.name))
+          owned = true, executorName = poolConfig.name, rejections = Some(rejections)))
       } catch {
         case e: Throwable =>
           // Half-built is worse than not built: give back the pools created so far before rethrowing.
@@ -184,7 +185,7 @@ object DualPool {
     handles.values.foreach { handle =>
       handle.dataSource.foreach { dataSource =>
         // Only a pool the library built is allowed to fail the start over missing metrics.
-        metricsRegistry.register(handle.role, PoolStatsSource(dataSource, handle.executorName), strict = handle.owned)
+        metricsRegistry.register(handle.role, PoolStatsSource(dataSource, handle.executorName, handle.rejections), strict = handle.owned)
       }
     }
 
@@ -237,7 +238,8 @@ object DualPool {
                                       executor: Option[AsyncExecutor],
                                       database: JdbcBackend#Database,
                                       owned: Boolean,
-                                      executorName: String) {
+                                      executorName: String,
+                                      rejections: Option[LongAdder] = None) {
 
     /**
      * Closing the Slick database shuts the executor down but deliberately leaves the DataSource alone, because

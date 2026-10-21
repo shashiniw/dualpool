@@ -4,6 +4,7 @@ import com.zaxxer.hikari.HikariDataSource
 import slick.util.AsyncExecutorMXBean
 
 import java.lang.management.ManagementFactory
+import java.util.concurrent.atomic.LongAdder
 import javax.management.{JMX, ObjectName}
 
 /**
@@ -30,6 +31,9 @@ trait PoolStatsSource {
 
   /** The executor's thread count, so an adopted pool's threads can be checked against its connections. */
   def executorMaxThreads: Int
+
+  /** Work refused because the executor queue was full, or -1 for an executor the library did not build. */
+  def executorRejected: Long
 }
 
 object PoolStatsSource {
@@ -47,10 +51,12 @@ object PoolStatsSource {
    *
    * @param executorName the Slick executor name, which the library keeps equal to the Hikari pool name
    */
-  def apply(dataSource: HikariDataSource, executorName: String): PoolStatsSource =
-    new HikariSlickStatsSource(dataSource, executorName)
+  def apply(dataSource: HikariDataSource, executorName: String, rejections: Option[LongAdder] = None): PoolStatsSource =
+    new HikariSlickStatsSource(dataSource, executorName, rejections)
 
-  private final class HikariSlickStatsSource(dataSource: HikariDataSource, executorName: String) extends PoolStatsSource {
+  private final class HikariSlickStatsSource(dataSource: HikariDataSource,
+                                             executorName: String,
+                                             rejections: Option[LongAdder]) extends PoolStatsSource {
 
     private val objectName = new ObjectName(s"slick:type=AsyncExecutor,name=$executorName")
 
@@ -69,6 +75,7 @@ object PoolStatsSource {
     def executorQueueCapacity: Int = executor(_.getMaxQueueSize)
     def executorActiveThreads: Int = executor(_.getActiveThreads)
     def executorMaxThreads: Int = executor(_.getMaxThreads)
+    def executorRejected: Long = rejections.map(_.sum).getOrElse(Unavailable.toLong)
 
     private def hikari(read: com.zaxxer.hikari.HikariPoolMXBean => Int): Int =
       try {
@@ -105,7 +112,8 @@ object PoolStatsSource {
             queueDepth: Int = 0,
             queueCapacity: Int = 0,
             activeThreads: Int = 0,
-            maxThreads: Int = 0): PoolStatsSource = new PoolStatsSource {
+            maxThreads: Int = 0,
+            rejected: Long = 0): PoolStatsSource = new PoolStatsSource {
     val poolName: String = name
     val activeConnections: Int = active
     val idleConnections: Int = idle
@@ -115,5 +123,6 @@ object PoolStatsSource {
     val executorQueueCapacity: Int = queueCapacity
     val executorActiveThreads: Int = activeThreads
     val executorMaxThreads: Int = maxThreads
+    val executorRejected: Long = rejected
   }
 }
