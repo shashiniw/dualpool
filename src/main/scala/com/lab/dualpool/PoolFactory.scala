@@ -5,6 +5,11 @@ import com.zaxxer.hikari.metrics.MetricsTrackerFactory
 import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
 import slick.jdbc.JdbcBackend
 import slick.util.AsyncExecutor
+import slick.util.AsyncExecutor.{PrioritizedRunnable, Priority}
+
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.LongAdder
+import scala.concurrent.{ExecutionContext, ExecutionContextExecutor}
 
 /** Builds the pieces of a single pool from its [[PoolConfig]] (proposal §4.2 "Pool construction"). */
 private[dualpool] object PoolFactory {
@@ -37,7 +42,9 @@ private[dualpool] object PoolFactory {
    * the source behind `slick_executor_queue_size`. Slick registers it lazily on first use, so the execution
    * context is forced here — an idle pool must still report (§5.5 "Registration timing").
    */
-  def executor(poolConfig: PoolConfig, decorator: AsyncExecutor => AsyncExecutor): AsyncExecutor = {
+  def executor(poolConfig: PoolConfig,
+               decorator: AsyncExecutor => AsyncExecutor,
+               rejections: LongAdder): AsyncExecutor = {
     val executor = AsyncExecutor(
       name = poolConfig.name,
       minThreads = poolConfig.numThreads,
@@ -46,7 +53,26 @@ private[dualpool] object PoolFactory {
       maxConnections = poolConfig.maxConnections,
       registerMbeans = true)
     executor.executionContext
-    decorator(executor)
+    decorator(countingRejections(executor, rejections))
+  }
+
+  /** Counts work the bounded queue refuses, passing everything else (including `prioritizedRunnable`) through. */
+  private def countingRejections(delegate: AsyncExecutor, rejections: LongAdder): AsyncExecutor = new AsyncExecutor {
+    lazy val executionContext: ExecutionContext = {
+      val inner = delegate.executionContext
+      new ExecutionContextExecutor {
+        def execute(runnable: Runnable): Unit =
+          try inner.execute(runnable)
+          catch { case e: RejectedExecutionException => rejections.increment(); throw e }
+        def reportFailure(cause: Throwable): Unit = inner.reportFailure(cause)
+      }
+    }
+
+    override def prioritizedRunnable(priority: => Priority,
+                                     run: PrioritizedRunnable.SetConnectionReleased => Unit): PrioritizedRunnable =
+      delegate.prioritizedRunnable(priority, run)
+
+    def close(): Unit = delegate.close()
   }
 
   /**

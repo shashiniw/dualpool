@@ -3,7 +3,7 @@ package com.lab.dualpool.metrics
 import com.lab.dualpool.DatabaseRole
 import com.zaxxer.hikari.metrics.MetricsTrackerFactory
 import com.zaxxer.hikari.metrics.prometheus.PrometheusMetricsTrackerFactory
-import io.prometheus.client.{Collector, CollectorRegistry, GaugeMetricFamily}
+import io.prometheus.client.{Collector, CollectorRegistry, CounterMetricFamily, GaugeMetricFamily}
 import org.slf4j.LoggerFactory
 
 import java.util.concurrent.ConcurrentHashMap
@@ -164,15 +164,19 @@ object PrometheusPoolMetricsRegistry {
         "Bound on the Slick executor queue", List("pool").asJava)
       val activeThreads = new GaugeMetricFamily("slick_executor_active_threads",
         "Threads currently executing in the Slick executor", List("pool").asJava)
+      val rejected = new CounterMetricFamily("slick_executor_rejected",
+        "Work refused because the Slick executor queue was full", List("pool").asJava)
 
       sources().foreach { stats =>
         val labels = List(stats.poolName).asJava
         queueSize.addMetric(labels, stats.executorQueueDepth.toDouble)
         queueCapacity.addMetric(labels, stats.executorQueueCapacity.toDouble)
         activeThreads.addMetric(labels, stats.executorActiveThreads.toDouble)
+        // Only executors the library built can be counted; no series rather than a counter stuck at -1.
+        if (stats.executorRejected >= 0) rejected.addMetric(labels, stats.executorRejected.toDouble)
       }
 
-      List[Collector.MetricFamilySamples](queueSize, queueCapacity, activeThreads).asJava
+      List[Collector.MetricFamilySamples](queueSize, queueCapacity, activeThreads, rejected).asJava
     }
   }
 }
