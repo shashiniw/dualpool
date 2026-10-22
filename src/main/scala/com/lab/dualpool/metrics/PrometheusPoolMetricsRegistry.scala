@@ -33,12 +33,17 @@ final class PrometheusPoolMetricsRegistry private (registry: CollectorRegistry) 
 
   // One factory per registry. HikariCP keeps the pools it has been told about in a single collector, so both
   // pools land in the same families, distinguished by the `pool` label rather than by metric name.
-  private val trackerFactory = new PrometheusMetricsTrackerFactory(registry)
+  // Wrapped so acquire time is also recorded as a histogram, which is the only form that aggregates across pods.
+  private val acquireHistogram = ConnectionAcquireHistogram.register(registry)
+  private val trackerFactory =
+    new DualPoolMetricsTrackerFactory(new PrometheusMetricsTrackerFactory(registry), acquireHistogram)
 
   def metricsTrackerFactory: Option[MetricsTrackerFactory] = Some(trackerFactory)
 
   def register(role: DatabaseRole, stats: PoolStatsSource, strict: Boolean): Unit = synchronized {
     sources.put(role, Registration(stats, strict))
+    // Create the child now so the pool's buckets exist before it has served a query (§5.5 registration timing).
+    acquireHistogram.labels(stats.poolName)
     if (!collectorRegistered) {
       registry.register(collector)
       collectorRegistered = true

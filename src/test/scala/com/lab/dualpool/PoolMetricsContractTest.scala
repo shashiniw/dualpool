@@ -72,6 +72,38 @@ class PoolMetricsContractTest extends AnyFunSuite with Matchers with HsqldbFixtu
     failure.getMessage should include("pool 'never-built' (Read) is missing metric 'hikaricp_active_connections'")
   }
 
+  test("acquire time is recorded as a histogram whose buckets actually contain the observations") {
+    // HikariCP's own histogram tracker tops out at 1.024ms, so on a real pool every observation lands in +Inf
+    // and histogram_quantile returns nothing usable. These buckets have to hold both a fast pooled handover
+    // and a multi-second wait, or the fleet-wide p95 the dashboard computes is a lie.
+    val registry = new CollectorRegistry()
+    withPool(newPool("histogram", registry, "histogram-write", "histogram-read")) { pool =>
+      (1 to 20).foreach(_ => await(ping(pool.readDb)))
+
+      def sample(name: String, labels: Array[String], values: Array[String]): Double =
+        Option(registry.getSampleValue(name, labels, values)).map(_.doubleValue()).getOrElse(0.0)
+
+      val observed = sample("dualpool_connection_acquired_seconds_count", Array("pool"), Array("histogram-read"))
+      observed should be >= 20.0
+
+      // Every observation must be inside a finite bucket, not only in +Inf.
+      val underTenSeconds = sample("dualpool_connection_acquired_seconds_bucket",
+        Array("pool", "le"), Array("histogram-read", "10.0"))
+      underTenSeconds shouldBe observed
+
+      // And the buckets must have enough resolution to separate a fast handover from a slow one: a pooled
+      // acquisition is sub-millisecond, so the small buckets have to be populated too.
+      val underOneMilli = sample("dualpool_connection_acquired_seconds_bucket",
+        Array("pool", "le"), Array("histogram-read", "0.001"))
+      withClue("no observation landed under 1ms, so the low buckets are useless: ") {
+        underOneMilli should be > 0.0
+      }
+
+      // The write pool published its buckets too, even though only the read pool served queries.
+      sample("dualpool_connection_acquired_seconds_count", Array("pool"), Array("histogram-write")) should be >= 0.0
+    }
+  }
+
   test("saturating the write pool does not change read pool metrics") {
     val registry = new CollectorRegistry()
     val configuration = dualPoolConfig(

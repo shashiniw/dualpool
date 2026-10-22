@@ -25,7 +25,10 @@ object PoolMetrics {
     "hikaricp_connections",
     "hikaricp_connection_acquired_nanos",
     "hikaricp_connection_timeout_total",
-    "slick_executor_queue_size"
+    "slick_executor_queue_size",
+    // A histogram of the same wait HikariCP reports as a Summary. Summary quantiles are computed per pod and
+    // cannot be aggregated; bucket counts can, so this is what a fleet-wide p95 is computed from.
+    "dualpool_connection_acquired_seconds"
   )
 
   /** Value used when a reading is not available, rather than a zero that would read as healthy. */
