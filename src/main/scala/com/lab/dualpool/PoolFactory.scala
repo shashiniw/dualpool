@@ -57,7 +57,7 @@ private[dualpool] object PoolFactory {
   }
 
   /** Counts work the bounded queue refuses, passing everything else (including `prioritizedRunnable`) through. */
-  private def countingRejections(delegate: AsyncExecutor, rejections: LongAdder): AsyncExecutor = new AsyncExecutor {
+  private[dualpool] def countingRejections(delegate: AsyncExecutor, rejections: LongAdder): AsyncExecutor = new AsyncExecutor {
     lazy val executionContext: ExecutionContext = {
       val inner = delegate.executionContext
       new ExecutionContextExecutor {

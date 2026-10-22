@@ -69,6 +69,8 @@ object DualPool {
    * @param adoptedWriteExecutorName the name of the service's own Slick executor, when it was built with
    *                                `registerMbeans = true`. Without it the write pool's queue depth reports as
    *                                unavailable (-1) rather than as a misleading zero.
+   * @param adoptedWriteRejections  the counter the service's executor was wrapped with via [[countingRejections]].
+   *                                Without it the write pool does not report `slick_executor_rejected_total`.
    */
   def adoptingWritePool(profile: JdbcProfile,
                         existingWriteDb: JdbcBackend#Database,
@@ -76,6 +78,7 @@ object DualPool {
                         executorDecorator: AsyncExecutor => AsyncExecutor = identity,
                         adoptedWriteDataSource: Option[HikariDataSource] = None,
                         adoptedWriteExecutorName: Option[String] = None,
+                        adoptedWriteRejections: Option[LongAdder] = None,
                         metricsRegistry: PoolMetricsRegistry = PoolMetricsRegistry.default): DualPool = {
     val adoptedConfig = config.copy(write =
       adoptedWriteConfig(config.write, existingWriteDb, adoptedWriteDataSource, adoptedWriteExecutorName))
@@ -89,7 +92,8 @@ object DualPool {
       executor = None,
       database = existingWriteDb,
       owned = false,
-      executorName = adoptedWriteExecutorName.getOrElse(adoptedConfig.write.name))
+      executorName = adoptedWriteExecutorName.getOrElse(adoptedConfig.write.name),
+      rejections = adoptedWriteRejections)
 
     // Attaching the exporter to a pool that is already running is supported by HikariCP, so the write pool can
     // be observed from the moment the read pool exists without restarting it.
@@ -110,6 +114,13 @@ object DualPool {
     val handles = build(profile, toBuild, Map(DatabaseRole.Write -> adoptedHandle), executorDecorator, metricsRegistry)
     finish(profile, handles, metricsRegistry)
   }
+
+  /**
+   * Wraps a service's own executor so the work its bounded queue refuses is counted in `rejections`. Pass the
+   * same counter to [[adoptingWritePool]] as `adoptedWriteRejections` to report it for the adopted write pool.
+   */
+  def countingRejections(executor: AsyncExecutor, rejections: LongAdder): AsyncExecutor =
+    PoolFactory.countingRejections(executor, rejections)
 
   /** Convenience: `DualPoolConfig.load(config)` followed by [[apply]]. */
   def fromConfig(profile: JdbcProfile,

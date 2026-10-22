@@ -66,7 +66,9 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
     hikariConfig.setMaximumPoolSize(4)
     hikariConfig.setConnectionTestQuery("SELECT 1 FROM INFORMATION_SCHEMA.SYSTEM_USERS")
     val existingDataSource = new HikariDataSource(hikariConfig)
-    val existingExecutor = AsyncExecutor("adopted-executor", 4, 4, 1000, 4, registerMbeans = true)
+    val rejections = new java.util.concurrent.atomic.LongAdder
+    val existingExecutor = DualPool.countingRejections(
+      AsyncExecutor("adopted-executor", 4, 4, 1000, 4, registerMbeans = true), rejections)
     val existingDb: JdbcBackend#Database = JdbcBackend.Database.forDataSource(existingDataSource, Some(4), existingExecutor)
 
     try {
@@ -83,6 +85,7 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
         profile, existingDb, configuration, identity,
         adoptedWriteDataSource = Some(existingDataSource),
         adoptedWriteExecutorName = Some("adopted-executor"),
+        adoptedWriteRejections = Some(rejections),
         metricsRegistry = PrometheusPoolMetricsRegistry.forRegistry(registry))
 
       try {
@@ -94,6 +97,10 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
         pool.metricsSnapshot(DatabaseRole.Write).poolName shouldBe "adopted-write"
         await(ping(pool.writeDb))
         pool.metricsSnapshot(DatabaseRole.Write).executorQueueDepth should be >= 0
+
+        // The service's executor was wrapped with the library's counter, so the write pool reports rejections too.
+        rejections.add(2)
+        registry.getSampleValue("slick_executor_rejected_total", Array("pool"), Array("adopted-write")) shouldBe 2.0
       } finally pool.close()
 
       // The adopted pool survives close(): the service built it and the service closes it.
