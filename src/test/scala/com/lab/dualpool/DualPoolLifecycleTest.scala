@@ -1,16 +1,17 @@
 package com.lab.dualpool
 
 import com.lab.dualpool.config.{DualPoolConfig, PoolConfigValidator}
-import com.lab.dualpool.metrics.{PoolStatsSource, PrometheusPoolMetricsRegistry}
+import com.lab.dualpool.internal.AdoptedPool
+import com.lab.dualpool.metrics.PrometheusPoolMetricsRegistry
+import com.lab.dualpool.support.{ExistingServicePool, Hsqldb, HsqldbFixture}
 import com.typesafe.config.ConfigFactory
-import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
 import io.prometheus.client.CollectorRegistry
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
-import slick.jdbc.JdbcBackend
-import slick.util.AsyncExecutor
 
+import java.util.concurrent.CountDownLatch
 import scala.concurrent.duration._
+import scala.util.Try
 
 class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture {
 
@@ -35,19 +36,19 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
 
   test("a bad url fails at construction, not on the first query") {
     val configuration = DualPoolConfig.load(ConfigFactory.parseString(
-      """db {
-        |  url = "jdbc:hsqldb:mem:ok"
-        |  driver = "org.hsqldb.jdbc.JDBCDriver"
-        |  username = "sa"
-        |  poolName = "probe-write"
-        |  validationQuery = "SELECT 1 FROM INFORMATION_SCHEMA.SYSTEM_USERS"
-        |}
-        |readDb {
-        |  url = "jdbc:hsqldb:hsql://127.0.0.1:1/nope"
-        |  poolName = "probe-read"
-        |  maxConnections = 2
-        |  connectionTimeout = 1s
-        |}""".stripMargin))
+      s"""db {
+         |  url = "${Hsqldb.url("probe")}"
+         |  driver = "${Hsqldb.Driver}"
+         |  username = "${Hsqldb.Username}"
+         |  poolName = "probe-write"
+         |  validationQuery = "${Hsqldb.TestQuery}"
+         |}
+         |readDb {
+         |  url = "jdbc:hsqldb:hsql://127.0.0.1:1/nope"
+         |  poolName = "probe-read"
+         |  maxConnections = 2
+         |  connectionTimeout = 1s
+         |}""".stripMargin))
 
     val failure = the[Exception] thrownBy DualPool(profile, configuration)
     failure.getMessage should include("dualpool: could not build the read pool 'probe-read'")
@@ -56,40 +57,22 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
   test("adoptingWritePool reuses the service's pool, reports it, and never closes it") {
     val name = databaseName("adopt")
     val registry = new CollectorRegistry()
-
-    // Stand in for what an existing service already owns: its own Hikari pool and Slick executor.
-    val hikariConfig = new HikariConfig()
-    hikariConfig.setPoolName("adopted-write")
-    hikariConfig.setJdbcUrl(s"jdbc:hsqldb:mem:$name")
-    hikariConfig.setDriverClassName("org.hsqldb.jdbc.JDBCDriver")
-    hikariConfig.setUsername("sa")
-    hikariConfig.setMaximumPoolSize(4)
-    hikariConfig.setConnectionTestQuery("SELECT 1 FROM INFORMATION_SCHEMA.SYSTEM_USERS")
-    val existingDataSource = new HikariDataSource(hikariConfig)
-    val rejections = new java.util.concurrent.atomic.LongAdder
-    val existingExecutor = DualPool.countingRejections(
-      AsyncExecutor("adopted-executor", 4, 4, 1000, 4, registerMbeans = true), rejections)
-    val existingDb: JdbcBackend#Database = JdbcBackend.Database.forDataSource(existingDataSource, Some(4), existingExecutor)
+    val existing = ExistingServicePool(
+      Hsqldb.url(name), Some("adopted-write"), "adopted-executor", countRejections = true)
 
     try {
       val configuration = DualPoolConfig.load(ConfigFactory.parseString(
-        s"""db { url = "jdbc:hsqldb:mem:$name", driver = "org.hsqldb.jdbc.JDBCDriver", username = "sa", maxPoolSize = 4 }
+        s"""db { url = "${Hsqldb.url(name)}", driver = "${Hsqldb.Driver}", username = "${Hsqldb.Username}", maxPoolSize = 4 }
            |readDb {
            |  poolName = "adopted-read"
            |  maxConnections = 2
            |  queueSize = 10
-           |  validationQuery = "SELECT 1 FROM INFORMATION_SCHEMA.SYSTEM_USERS"
+           |  validationQuery = "${Hsqldb.TestQuery}"
            |}""".stripMargin))
 
-      val pool = DualPool.adoptingWritePool(
-        profile, existingDb, configuration, identity,
-        adoptedWriteDataSource = Some(existingDataSource),
-        adoptedWriteExecutorName = Some("adopted-executor"),
-        adoptedWriteRejections = Some(rejections),
-        metricsRegistry = PrometheusPoolMetricsRegistry.forRegistry(registry))
-
+      val pool = adopt(existing, configuration, registry, rejections = true)
       try {
-        pool.writeDb should be theSameInstanceAs existingDb
+        pool.writeDb should be theSameInstanceAs existing.database
         pool.isReadPoolIsolated shouldBe true
 
         // Both pools report, which is what makes read and write comparable on one dashboard.
@@ -99,17 +82,14 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
         pool.metricsSnapshot(DatabaseRole.Write).executorQueueDepth should be >= 0
 
         // The service's executor was wrapped with the library's counter, so the write pool reports rejections too.
-        rejections.add(2)
+        existing.rejections.add(2)
         registry.getSampleValue("slick_executor_rejected_total", Array("pool"), Array("adopted-write")) shouldBe 2.0
       } finally pool.close()
 
       // The adopted pool survives close(): the service built it and the service closes it.
-      existingDataSource.isClosed shouldBe false
-      await(ping(existingDb))
-    } finally {
-      existingDb.close()
-      existingDataSource.close()
-    }
+      existing.dataSource.isClosed shouldBe false
+      await(ping(existing.database))
+    } finally existing.close()
   }
 
   test("an adopted write pool with the read pool disabled gets metrics but no second pool") {
@@ -117,33 +97,18 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
     // behaviour is unchanged, but the write pool is now reported and there is a before-picture to compare to.
     val name = databaseName("metrics-only")
     val registry = new CollectorRegistry()
-
-    val hikariConfig = new HikariConfig()
-    hikariConfig.setPoolName("metrics-only-write")
-    hikariConfig.setJdbcUrl(s"jdbc:hsqldb:mem:$name")
-    hikariConfig.setDriverClassName("org.hsqldb.jdbc.JDBCDriver")
-    hikariConfig.setUsername("sa")
-    hikariConfig.setMaximumPoolSize(4)
-    hikariConfig.setConnectionTestQuery("SELECT 1 FROM INFORMATION_SCHEMA.SYSTEM_USERS")
-    val existingDataSource = new HikariDataSource(hikariConfig)
-    val existingExecutor = AsyncExecutor("metrics-only-executor", 4, 4, 1000, 4, registerMbeans = true)
-    val existingDb: JdbcBackend#Database = JdbcBackend.Database.forDataSource(existingDataSource, Some(4), existingExecutor)
+    val existing = ExistingServicePool(Hsqldb.url(name), Some("metrics-only-write"), "metrics-only-executor")
 
     try {
       val configuration = DualPoolConfig.load(ConfigFactory.parseString(
-        s"""db { url = "jdbc:hsqldb:mem:$name", driver = "org.hsqldb.jdbc.JDBCDriver", username = "sa", maxPoolSize = 4 }
+        s"""db { url = "${Hsqldb.url(name)}", driver = "${Hsqldb.Driver}", username = "${Hsqldb.Username}", maxPoolSize = 4 }
            |readDb { enabled = false, maxConnections = 2 }""".stripMargin))
       configuration.read shouldBe None
 
-      val pool = DualPool.adoptingWritePool(
-        profile, existingDb, configuration, identity,
-        adoptedWriteDataSource = Some(existingDataSource),
-        adoptedWriteExecutorName = Some("metrics-only-executor"),
-        metricsRegistry = PrometheusPoolMetricsRegistry.forRegistry(registry))
-
+      val pool = adopt(existing, configuration, registry)
       try {
         pool.isReadPoolIsolated shouldBe false
-        pool.readDb should be theSameInstanceAs existingDb
+        pool.readDb should be theSameInstanceAs existing.database
 
         await(ping(pool.writeDb))
         noException should be thrownBy pool.metrics.verifyRegistered()
@@ -155,124 +120,78 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
         writeMetrics.totalConnections should be > 0
       } finally pool.close()
 
-      existingDataSource.isClosed shouldBe false
-    } finally {
-      existingDb.close()
-      existingDataSource.close()
-    }
+      existing.dataSource.isClosed shouldBe false
+    } finally existing.close()
   }
 
-  test("an adopted pool built with setters still reports, because the library starts it") {
-    // A service may build its write pool as `new HikariDataSource()` plus setters, which does
-    // not start the pool until the first getConnection. HikariCP registers a pool with its Prometheus exporter
-    // only when the pool starts, so before the library warmed it up this combination failed the service start
-    // with "pool metrics are not fully registered".
+  test("an adopted pool that has not started yet still reports, because the library starts it") {
+    // A pool built with setters rather than from a HikariConfig does not start until its first getConnection,
+    // and HikariCP registers a pool with its exporter only when it starts. Without the warm-up this combination
+    // failed the service start with "pool metrics are not fully registered".
     val name = databaseName("lazy-adopt")
     val registry = new CollectorRegistry()
-
-    val existingDataSource = new HikariDataSource()
-    existingDataSource.setPoolName("lazy-adopted-write")
-    existingDataSource.setJdbcUrl(s"jdbc:hsqldb:mem:$name")
-    existingDataSource.setDriverClassName("org.hsqldb.jdbc.JDBCDriver")
-    existingDataSource.setUsername("sa")
-    existingDataSource.setMaximumPoolSize(4)
-    existingDataSource.setConnectionTestQuery("SELECT 1 FROM INFORMATION_SCHEMA.SYSTEM_USERS")
-    existingDataSource.isRunning shouldBe false
-
-    val existingExecutor = AsyncExecutor("lazy-adopted-executor", 4, 4, 1000, 4, registerMbeans = true)
-    val existingDb: JdbcBackend#Database = JdbcBackend.Database.forDataSource(existingDataSource, Some(4), existingExecutor)
+    val existing = ExistingServicePool(
+      Hsqldb.url(name), Some("lazy-adopted-write"), "lazy-adopted-executor", startEagerly = false)
 
     try {
+      existing.dataSource.isRunning shouldBe false
+
       val configuration = DualPoolConfig.load(ConfigFactory.parseString(
         s"""db {
-           |  url = "jdbc:hsqldb:mem:$name"
-           |  driver = "org.hsqldb.jdbc.JDBCDriver"
-           |  username = "sa"
+           |  url = "${Hsqldb.url(name)}"
+           |  driver = "${Hsqldb.Driver}"
+           |  username = "${Hsqldb.Username}"
            |  maxPoolSize = 4
-           |  preferredTestQuery = "SELECT 1 FROM INFORMATION_SCHEMA.SYSTEM_USERS"
+           |  preferredTestQuery = "${Hsqldb.TestQuery}"
            |}
            |readDb { poolName = "lazy-adopted-read", maxConnections = 2, queueSize = 10 }""".stripMargin))
 
-      val pool = DualPool.adoptingWritePool(
-        profile, existingDb, configuration, identity,
-        adoptedWriteDataSource = Some(existingDataSource),
-        adoptedWriteExecutorName = Some("lazy-adopted-executor"),
-        metricsRegistry = PrometheusPoolMetricsRegistry.forRegistry(registry))
-
+      val pool = adopt(existing, configuration, registry)
       try {
         pool.metricsSnapshot(DatabaseRole.Write).totalConnections should be > 0
         pool.metricsSnapshot(DatabaseRole.Read).poolName shouldBe "lazy-adopted-read"
       } finally pool.close()
-    } finally {
-      existingDb.close()
-      existingDataSource.close()
-    }
+    } finally existing.close()
   }
 
   test("an adopted pool is checked as the service built it, not as its config describes it") {
-    // `db.maxPoolSize = 6` implies 6 threads, but the executor is sized in code with 20 threads and a 1000 queue.
-    // The mismatch is a warning, so the service still starts.
+    // `db.maxPoolSize = 6` implies 6 threads, but the executor is sized in code with 20 threads and a 1000
+    // queue. The mismatch is a warning, so the service still starts.
     val name = databaseName("actual-sizing")
-    val existingDataSource = new HikariDataSource()
-    existingDataSource.setPoolName("actual-sizing-write")
-    existingDataSource.setJdbcUrl(s"jdbc:hsqldb:mem:$name")
-    existingDataSource.setMaximumPoolSize(6)
-    val existingExecutor = AsyncExecutor("actual-sizing-executor", 20, 20, 1000, 20, registerMbeans = true)
-    val existingDb: JdbcBackend#Database = JdbcBackend.Database.forDataSource(existingDataSource, None, existingExecutor)
+    val existing = ExistingServicePool(
+      Hsqldb.url(name), Some("actual-sizing-write"), "actual-sizing-executor",
+      maxConnections = 6, executorThreads = 20, startEagerly = false)
 
     try {
       val configuration = DualPoolConfig.load(ConfigFactory.parseString(
-        s"""db { url = "jdbc:hsqldb:mem:$name", maxPoolSize = 6 }"""))
+        s"""db { url = "${Hsqldb.url(name)}", maxPoolSize = 6 }"""))
 
-      val write = DualPool.adoptedWriteConfig(
-        configuration.write, existingDb, Some(existingDataSource), Some("actual-sizing-executor"))
+      val write = AdoptedPool.effectiveConfig(
+        configuration.write, existing.database, Some(existing.dataSource), Some(existing.executorName))
 
       (write.maxConnections, write.numThreads, write.queueSize) shouldBe ((6, 20, 1000))
       PoolConfigValidator.validate(configuration.copy(write = write)) shouldBe Seq(PoolConfigValidator.Warning(
         "db (pool 'actual-sizing-write'): numThreads (20) != maxConnections (6); surplus threads block inside " +
           "Slick waiting for a connection, which hides saturation from the queue metric"))
-    } finally {
-      existingDb.close()
-      existingDataSource.close()
-    }
+    } finally existing.close()
   }
 
   test("an adopted executor without MBeans cannot be checked, so it is not reported as mismatched") {
     val name = databaseName("no-mbeans")
-    val existingDataSource = new HikariDataSource()
-    existingDataSource.setJdbcUrl(s"jdbc:hsqldb:mem:$name")
-    existingDataSource.setMaximumPoolSize(4)
-    val existingExecutor = AsyncExecutor("no-mbeans-executor", 20, 20, 1000, 20, registerMbeans = false)
-    val existingDb: JdbcBackend#Database = JdbcBackend.Database.forDataSource(existingDataSource, None, existingExecutor)
+    val existing = ExistingServicePool(
+      Hsqldb.url(name), poolName = None, "no-mbeans-executor",
+      executorThreads = 20, startEagerly = false, registerMbeans = false)
 
     try {
       val configuration = DualPoolConfig.load(ConfigFactory.parseString(
-        s"""db { url = "jdbc:hsqldb:mem:$name", maxPoolSize = 4 }"""))
+        s"""db { url = "${Hsqldb.url(name)}", maxPoolSize = 4 }"""))
 
-      val write = DualPool.adoptedWriteConfig(
-        configuration.write, existingDb, Some(existingDataSource), Some("no-mbeans-executor"))
+      val write = AdoptedPool.effectiveConfig(
+        configuration.write, existing.database, Some(existing.dataSource), Some(existing.executorName))
 
       (write.maxConnections, write.numThreads, write.queueSize) shouldBe ((4, 4, configuration.write.queueSize))
       PoolConfigValidator.validate(configuration.copy(write = write)) shouldBe empty
-    } finally {
-      existingDb.close()
-      existingDataSource.close()
-    }
-  }
-
-  test("a read pool the library built must publish, even though an adopted one need not") {
-    // The asymmetry is deliberate: the library controls a pool it built, so missing metrics there are a bug
-    // worth failing the boot over. An adopted pool's lifecycle belongs to the service.
-    val registry = new CollectorRegistry()
-    val metrics = PrometheusPoolMetricsRegistry.forRegistry(registry)
-
-    metrics.register(DatabaseRole.Write, PoolStatsSource.fixed("silent-adopted"), strict = false)
-    noException should be thrownBy metrics.verifyRegistered()
-
-    metrics.register(DatabaseRole.Read, PoolStatsSource.fixed("silent-owned"), strict = true)
-    val failure = the[IllegalStateException] thrownBy metrics.verifyRegistered()
-    failure.getMessage should include("pool 'silent-owned' (Read) is missing metric")
-    failure.getMessage should not include "silent-adopted"
+    } finally existing.close()
   }
 
   test("the read queue is bounded, so overload is refused rather than accumulated") {
@@ -282,28 +201,37 @@ class DualPoolLifecycleTest extends AnyFunSuite with Matchers with HsqldbFixture
       Some(readSection("overload-read", maxConnections = 1, queueSize = 1)))
 
     withPool(DualPool(profile, configuration)) { pool =>
-      val release = new java.util.concurrent.CountDownLatch(1)
+      val release = new CountDownLatch(1)
       val blocker = hold(pool.readDb, release).recover { case _ => () }
 
       try {
         eventually() { pool.metricsSnapshot(DatabaseRole.Read).activeConnections == 1 } shouldBe true
 
         val flood = (1 to 50).map(_ => ping(pool.readDb))
-        val rejected = eventually(10.seconds) {
-          flood.count(_.value.exists(_.isFailure)) > 0
-        }
+        def failures = flood.count(_.value.exists(_.isFailure))
 
         withClue("a bounded queue must reject once it is full rather than growing without limit: ") {
-          rejected shouldBe true
+          eventually(10.seconds) { failures > 0 } shouldBe true
         }
 
-        val failed = flood.count(_.value.exists(_.isFailure))
+        val rejected = failures
         CollectorRegistry.defaultRegistry.getSampleValue(
-          "slick_executor_rejected_total", Array("pool"), Array("overload-read")) shouldBe failed.toDouble
+          "slick_executor_rejected_total", Array("pool"), Array("overload-read")) shouldBe rejected.toDouble
       } finally {
         release.countDown()
-        scala.util.Try(await(blocker))
+        Try(await(blocker))
       }
     }
   }
+
+  private def adopt(existing: ExistingServicePool,
+                    configuration: DualPoolConfig,
+                    registry: CollectorRegistry,
+                    rejections: Boolean = false): DualPool =
+    DualPool.adoptingWritePool(
+      profile, existing.database, configuration,
+      adoptedWriteDataSource = Some(existing.dataSource),
+      adoptedWriteExecutorName = Some(existing.executorName),
+      adoptedWriteRejections = if (rejections) Some(existing.rejections) else None,
+      metricsRegistry = PrometheusPoolMetricsRegistry.forRegistry(registry))
 }

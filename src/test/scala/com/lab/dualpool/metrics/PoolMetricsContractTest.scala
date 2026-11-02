@@ -1,32 +1,18 @@
-package com.lab.dualpool
+package com.lab.dualpool.metrics
 
-import com.lab.dualpool.metrics.{PoolMetrics, PrometheusPoolMetricsRegistry}
+import com.lab.dualpool.support.HsqldbFixture
+import com.lab.dualpool.{DatabaseRole, DualPool}
 import io.prometheus.client.CollectorRegistry
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import java.util.concurrent.CountDownLatch
+import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
+import scala.util.Try
 
-/** Contract tests from proposal §5.5 / §7.2. */
+/** Every pool must publish the same metrics under its own `pool` label, whether or not it has served a query. */
 class PoolMetricsContractTest extends AnyFunSuite with Matchers with HsqldbFixture {
-
-  private def newPool(suffix: String, registry: CollectorRegistry, writePool: String, readPool: String) =
-    DualPool(
-      profile,
-      dualPoolConfig(databaseName(suffix), writePool, Some(readSection(readPool))),
-      identity,
-      PrometheusPoolMetricsRegistry.forRegistry(registry))
-
-  /** Every metric name published for a given `pool` label value. */
-  private def namesFor(registry: CollectorRegistry, poolName: String): Set[String] =
-    registry.metricFamilySamples().asScala
-      .flatMap(_.samples.asScala)
-      .filter { sample =>
-        val index = sample.labelNames.indexOf("pool")
-        index >= 0 && sample.labelValues.get(index) == poolName
-      }
-      .map(_.name)
-      .toSet
 
   test("every pool exposes the same metric set under its own name") {
     val registry = new CollectorRegistry()
@@ -63,19 +49,32 @@ class PoolMetricsContractTest extends AnyFunSuite with Matchers with HsqldbFixtu
   }
 
   test("verifyRegistered fails when a pool publishes nothing") {
-    val registry = new CollectorRegistry()
-    val metrics = PrometheusPoolMetricsRegistry.forRegistry(registry)
-    metrics.register(DatabaseRole.Read, com.lab.dualpool.metrics.PoolStatsSource.fixed("never-built"), strict = true)
+    val metrics = PrometheusPoolMetricsRegistry.forRegistry(new CollectorRegistry())
+    metrics.register(DatabaseRole.Read, PoolStatsSource.fixed("never-built"), strict = true)
 
-    // The Slick family is published by the library's own collector, so the Hikari families are what is missing.
+    // The Slick families come from the library's own collector, so the HikariCP ones are what is missing.
     val failure = the[IllegalStateException] thrownBy metrics.verifyRegistered()
     failure.getMessage should include("pool 'never-built' (Read) is missing metric 'hikaricp_active_connections'")
   }
 
+  test("a pool the library built must publish, but an adopted one need not") {
+    // The asymmetry is deliberate: the library controls a pool it built, so missing metrics there are a bug
+    // worth failing the boot over. An adopted pool's lifecycle belongs to the service.
+    val metrics = PrometheusPoolMetricsRegistry.forRegistry(new CollectorRegistry())
+
+    metrics.register(DatabaseRole.Write, PoolStatsSource.fixed("silent-adopted"), strict = false)
+    noException should be thrownBy metrics.verifyRegistered()
+
+    metrics.register(DatabaseRole.Read, PoolStatsSource.fixed("silent-owned"), strict = true)
+    val failure = the[IllegalStateException] thrownBy metrics.verifyRegistered()
+    failure.getMessage should include("pool 'silent-owned' (Read) is missing metric")
+    failure.getMessage should not include "silent-adopted"
+  }
+
   test("acquire time is recorded as a histogram whose buckets actually contain the observations") {
     // HikariCP's own histogram tracker tops out at 1.024ms, so on a real pool every observation lands in +Inf
-    // and histogram_quantile returns nothing usable. These buckets have to hold both a fast pooled handover
-    // and a multi-second wait, or the fleet-wide p95 the dashboard computes is a lie.
+    // and histogram_quantile returns nothing usable. These buckets have to hold both a fast pooled handover and
+    // a multi-second wait, or the fleet-wide p95 the dashboard computes is a lie.
     val registry = new CollectorRegistry()
     withPool(newPool("histogram", registry, "histogram-write", "histogram-read")) { pool =>
       (1 to 20).foreach(_ => await(ping(pool.readDb)))
@@ -91,7 +90,7 @@ class PoolMetricsContractTest extends AnyFunSuite with Matchers with HsqldbFixtu
         Array("pool", "le"), Array("histogram-read", "10.0"))
       underTenSeconds shouldBe observed
 
-      // And the buckets must have enough resolution to separate a fast handover from a slow one: a pooled
+      // And the buckets need enough resolution to separate a fast handover from a slow one: a pooled
       // acquisition is sub-millisecond, so the small buckets have to be populated too.
       val underOneMilli = sample("dualpool_connection_acquired_seconds_bucket",
         Array("pool", "le"), Array("histogram-read", "0.001"))
@@ -113,7 +112,7 @@ class PoolMetricsContractTest extends AnyFunSuite with Matchers with HsqldbFixtu
       writeOverrides = "maxConnections = 2\nqueueSize = 4")
 
     withPool(DualPool(profile, configuration, identity, PrometheusPoolMetricsRegistry.forRegistry(registry))) { pool =>
-      val release = new java.util.concurrent.CountDownLatch(1)
+      val release = new CountDownLatch(1)
       // Two connections held plus four queued: the write pool is full and its queue is backing up.
       val stalled = (1 to 6).map(_ => hold(pool.writeDb, release).recover { case _ => () })
 
@@ -130,17 +129,35 @@ class PoolMetricsContractTest extends AnyFunSuite with Matchers with HsqldbFixtu
         readMetrics.executorQueueDepth shouldBe 0
         readMetrics.activeConnections shouldBe 0
 
-        // And reads still work, at normal latency, while the write pool is saturated (§7.2 fault injection).
+        // And reads still work, at normal latency, while the write pool is saturated.
         val startedAt = System.nanoTime()
-        await(ping(pool.readDb), scala.concurrent.duration.DurationInt(5).seconds)
-        val elapsedMillis = (System.nanoTime() - startedAt) / 1000000
-        withClue(s"read took ${elapsedMillis}ms while the write pool was saturated: ") {
-          elapsedMillis should be < 1000L
+        await(ping(pool.readDb), 5.seconds)
+        val elapsed = (System.nanoTime() - startedAt).nanos
+        withClue(s"read took ${elapsed.toMillis}ms while the write pool was saturated: ") {
+          elapsed.toMillis should be < 1000L
         }
       } finally {
         release.countDown()
-        stalled.foreach(future => scala.util.Try(await(future)))
+        stalled.foreach(future => Try(await(future)))
       }
     }
   }
+
+  private def newPool(suffix: String, registry: CollectorRegistry, writePool: String, readPool: String): DualPool =
+    DualPool(
+      profile,
+      dualPoolConfig(databaseName(suffix), writePool, Some(readSection(readPool))),
+      identity,
+      PrometheusPoolMetricsRegistry.forRegistry(registry))
+
+  /** Every metric name published for a given `pool` label value. */
+  private def namesFor(registry: CollectorRegistry, poolName: String): Set[String] =
+    registry.metricFamilySamples().asScala
+      .flatMap(_.samples.asScala)
+      .filter { sample =>
+        val index = sample.labelNames.indexOf("pool")
+        index >= 0 && sample.labelValues.get(index) == poolName
+      }
+      .map(_.name)
+      .toSet
 }

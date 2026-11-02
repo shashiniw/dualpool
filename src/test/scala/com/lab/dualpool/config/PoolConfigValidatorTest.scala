@@ -1,15 +1,19 @@
-package com.lab.dualpool
+package com.lab.dualpool.config
 
 import com.lab.dualpool.config.PoolConfigValidator.{Error, Warning}
-import com.lab.dualpool.config.{DualPoolConfig, PoolConfig, PoolConfigValidator}
+import org.scalatest.LoneElement
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import scala.concurrent.duration._
 
-class PoolConfigValidatorTest extends AnyFunSuite with Matchers {
+class PoolConfigValidatorTest extends AnyFunSuite with Matchers with LoneElement {
 
-  private def pool(name: String, threads: Int = 4, connections: Int = 4, queue: Int = 100, adopted: Boolean = false) =
+  private def pool(name: String,
+                   threads: Int = 4,
+                   connections: Int = 4,
+                   queue: Int = 100,
+                   adopted: Boolean = false): PoolConfig =
     PoolConfig(
       name = name,
       url = "jdbc:hsqldb:mem:validator",
@@ -22,7 +26,7 @@ class PoolConfigValidatorTest extends AnyFunSuite with Matchers {
       connectionTimeout = 2.seconds,
       adopted = adopted)
 
-  private def errorsOf(config: DualPoolConfig, instances: Int = 1, limit: Option[Int] = None) =
+  private def errorsOf(config: DualPoolConfig, instances: Int = 1, limit: Option[Int] = None): Seq[String] =
     PoolConfigValidator.validate(config, instances, limit).collect { case Error(message) => message }
 
   test("numThreads different from maxConnections is reported") {
@@ -76,10 +80,5 @@ class PoolConfigValidatorTest extends AnyFunSuite with Matchers {
 
     val good = DualPoolConfig(pool("write"), Some(pool("read")), None)
     noException should be thrownBy PoolConfigValidator.validateOrFail(good, 6, Some(100))
-  }
-
-  private implicit class SeqOps[A](seq: Seq[A]) {
-    def loneElement: A =
-      if (seq.size == 1) seq.head else fail(s"expected exactly one element, got ${seq.size}: ${seq.mkString(", ")}")
   }
 }

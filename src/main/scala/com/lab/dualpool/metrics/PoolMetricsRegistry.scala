@@ -4,18 +4,18 @@ import com.lab.dualpool.DatabaseRole
 import com.zaxxer.hikari.metrics.MetricsTrackerFactory
 import org.slf4j.LoggerFactory
 
-/** Per-pool metric registration and reading (proposal §5.5). */
+/** Registers and reads the metrics of each pool. */
 trait PoolMetricsRegistry {
 
   /**
    * Attached to every HikariCP pool the library builds, and to an adopted pool when the service hands over its
-   * DataSource. This is what produces the `hikaricp_*` families; None means no Hikari metrics are exported.
+   * DataSource. This is what produces the `hikaricp_*` families; None means no HikariCP metrics are exported.
    */
   def metricsTrackerFactory: Option[MetricsTrackerFactory]
 
   /**
-   * Registers all [[PoolMetrics.MetricNames]] for the pool under a distinct, stable name
-   * ("Per-pool naming"). Must run eagerly at pool creation, not lazily on first query.
+   * Registers all of [[PoolMetrics.MetricNames]] for this pool under its own `pool` label. Runs eagerly at pool
+   * creation, not lazily on first query.
    *
    * @param strict whether [[verifyRegistered]] may fail the service over this pool. True for a pool the library
    *               built, because it controls that pool completely. False for an adopted pool, whose lifecycle
@@ -25,8 +25,8 @@ trait PoolMetricsRegistry {
   def register(role: DatabaseRole, stats: PoolStatsSource, strict: Boolean): Unit
 
   /**
-   * "Registration timing": fails if any strict pool is missing any metric, so an unused pool is not healthy by
-   * omission. A non-strict pool's gaps are logged instead.
+   * Fails if any strict pool is missing any metric, so an unused pool is not reported as healthy by omission.
+   * A non-strict pool's gaps are logged instead.
    */
   def verifyRegistered(): Unit
 
@@ -54,33 +54,8 @@ object PoolMetricsRegistry {
       PrometheusPoolMetricsRegistry.forRegistry()
     } catch {
       case _: ClassNotFoundException | _: NoClassDefFoundError =>
-        logger.warn("dualpool: io.prometheus.client not on the classpath; pool metrics are not exported. " +
-          "Add io.prometheus:simpleclient to get per-pool observability (proposal section 5.5).")
+        logger.warn("dualpool: io.prometheus.client is not on the classpath, so pool metrics are not exported. " +
+          "Add io.prometheus:simpleclient to get per-pool observability.")
         NoOpPoolMetricsRegistry
     }
-}
-
-/** Used when no metrics stack is available. Snapshots still work, so a service can log or expose them itself. */
-object NoOpPoolMetricsRegistry extends PoolMetricsRegistry {
-
-  private val sources = new java.util.concurrent.ConcurrentHashMap[DatabaseRole, PoolStatsSource]()
-
-  def metricsTrackerFactory: Option[MetricsTrackerFactory] = None
-
-  def register(role: DatabaseRole, stats: PoolStatsSource, strict: Boolean): Unit = { sources.put(role, stats); () }
-
-  def verifyRegistered(): Unit = ()
-
-  def snapshot(role: DatabaseRole): PoolMetrics = {
-    val stats = sources.get(role)
-    if (stats == null) throw new IllegalArgumentException(s"dualpool: no pool registered for role $role")
-    PoolMetrics.from(stats, PoolMetrics.Unavailable.toLong)
-  }
-
-  def snapshotAll(): Map[DatabaseRole, PoolMetrics] = {
-    import scala.jdk.CollectionConverters._
-    sources.asScala.map { case (role, stats) => role -> PoolMetrics.from(stats, PoolMetrics.Unavailable.toLong) }.toMap
-  }
-
-  def unregister(role: DatabaseRole): Unit = { sources.remove(role); () }
 }

@@ -1,10 +1,12 @@
-package com.lab.dualpool
+package com.lab.dualpool.support
 
+import com.lab.dualpool.DualPool
 import com.lab.dualpool.config.DualPoolConfig
 import com.typesafe.config.{Config, ConfigFactory}
-import slick.jdbc.HsqldbProfile
+import slick.jdbc.{HsqldbProfile, JdbcBackend}
 
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.{CountDownLatch, TimeUnit}
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -24,12 +26,12 @@ trait HsqldbFixture {
                        writeOverrides: String = ""): Config =
     ConfigFactory.parseString(
       s"""db {
-         |  url = "jdbc:hsqldb:mem:$name"
-         |  driver = "org.hsqldb.jdbc.JDBCDriver"
-         |  username = "sa"
+         |  url = "${Hsqldb.url(name)}"
+         |  driver = "${Hsqldb.Driver}"
+         |  username = "${Hsqldb.Username}"
          |  password = ""
          |  poolName = "$writePool"
-         |  validationQuery = "SELECT 1 FROM INFORMATION_SCHEMA.SYSTEM_USERS"
+         |  validationQuery = "${Hsqldb.TestQuery}"
          |  $writeOverrides
          |}
          |${readSection.getOrElse("")}
@@ -49,23 +51,23 @@ trait HsqldbFixture {
        |  connectionTimeout = 2s
        |}""".stripMargin
 
-  /** Runs the pool's own validation query, which is the cheapest thing that exercises connection + executor. */
-  protected def ping(database: slick.jdbc.JdbcBackend#Database): Future[Unit] = {
+  /** Runs one query, which is the cheapest thing that exercises both a connection and an executor thread. */
+  protected def ping(database: JdbcBackend#Database): Future[Unit] = {
     import profile.api._
     database.run(SimpleDBIO[Unit] { context =>
       val statement = context.connection.createStatement()
-      try statement.execute("SELECT 1 FROM INFORMATION_SCHEMA.SYSTEM_USERS") finally statement.close()
+      try statement.execute(Hsqldb.TestQuery) finally statement.close()
     })
   }
 
   /** Occupies one executor thread and one connection until `release` is counted down. */
-  protected def hold(database: slick.jdbc.JdbcBackend#Database, release: java.util.concurrent.CountDownLatch): Future[Unit] = {
+  protected def hold(database: JdbcBackend#Database, release: CountDownLatch): Future[Unit] = {
     import profile.api._
     database.run(SimpleDBIO[Unit] { context =>
       val statement = context.connection.createStatement()
       try {
-        statement.execute("SELECT 1 FROM INFORMATION_SCHEMA.SYSTEM_USERS")
-        release.await(30, java.util.concurrent.TimeUnit.SECONDS)
+        statement.execute(Hsqldb.TestQuery)
+        release.await(30, TimeUnit.SECONDS)
         ()
       } finally statement.close()
     })

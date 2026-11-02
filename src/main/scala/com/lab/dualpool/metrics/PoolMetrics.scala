@@ -1,6 +1,6 @@
 package com.lab.dualpool.metrics
 
-/** Point-in-time view of one pool. Every pool exposes exactly this set (proposal §5.5). */
+/** Point-in-time view of one pool. Every pool exposes exactly this set. */
 final case class PoolMetrics(poolName: String,
                              activeConnections: Int,
                              idleConnections: Int,
@@ -11,12 +11,15 @@ final case class PoolMetrics(poolName: String,
 
 object PoolMetrics {
 
+  /** Value used when a reading is not available, rather than a zero that would read as healthy. */
+  val Unavailable: Int = -1
+
   /**
-   * The metric names every pool must expose, each carrying a `pool` label. The first six come from HikariCP's
-   * own Prometheus exporter; `slick_executor_queue_size` is the library's, and is the one to alert on (§5.5).
+   * The metric names every pool must publish, each carrying a `pool` label. The `hikaricp_*` names come from
+   * HikariCP's own Prometheus exporter; the rest are this library's.
    *
-   * The contract test asserts that every pool publishes every one of these under its own `pool` label, including
-   * a pool that has not yet served a query.
+   * `verifyRegistered` and the contract test assert that every pool publishes every one of these, including a
+   * pool that has not yet served a query — a metric missing entirely reads as healthy on a dashboard.
    */
   val MetricNames: Seq[String] = Seq(
     "hikaricp_active_connections",
@@ -26,13 +29,7 @@ object PoolMetrics {
     "hikaricp_connection_acquired_nanos",
     "hikaricp_connection_timeout_total",
     "slick_executor_queue_size",
-    // A histogram of the same wait HikariCP reports as a Summary. Summary quantiles are computed per pod and
-    // cannot be aggregated; bucket counts can, so this is what a fleet-wide p95 is computed from.
-    "dualpool_connection_acquired_seconds"
-  )
-
-  /** Value used when a reading is not available, rather than a zero that would read as healthy. */
-  val Unavailable: Int = -1
+    ConnectionAcquireHistogram.MetricName)
 
   def from(stats: PoolStatsSource, connectionWaitMillisP95: Long): PoolMetrics =
     PoolMetrics(
@@ -42,6 +39,5 @@ object PoolMetrics {
       pendingConnections = stats.pendingConnections,
       totalConnections = stats.totalConnections,
       executorQueueDepth = stats.executorQueueDepth,
-      connectionWaitMillisP95 = connectionWaitMillisP95
-    )
+      connectionWaitMillisP95 = connectionWaitMillisP95)
 }
