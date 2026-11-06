@@ -1,78 +1,174 @@
 # dualpool
 
-Read/write connection pool isolation for Slick services, as described in the
-*Read/Write Connection Pool Isolation* proposal (13 Oct 2026).
+Separate read and write connection pools for Slick services.
 
-Each workload gets its own HikariCP pool, its own Slick executor and bounded queue, and its own metrics.
-A stalled write can no longer starve reads of connections.
+A service with one connection pool has one failure mode: a slow or stalled write holds every connection, and
+reads start failing with it. dualpool gives each workload its own pool — its own HikariCP connections, its own
+Slick executor with a bounded queue, and its own metrics — so the two can no longer starve each other.
 
-> **Status: skeleton.** The public API and package layout follow the proposal, but method bodies are `???`.
-> It compiles and publishes, so services can wire against it. Calling any stub throws `NotImplementedError`.
+Adding it is a config change. Existing code keeps working: until a `readDb` section exists, `readDb` *is* the
+write pool, the same object.
 
-## Build
+---
 
-```bash
-export JAVA_HOME=~/.sdkman/candidates/java/25.0.3-tem
-sbt test          # compiles (Scala 2.13.18) and runs the pending test skeletons
-sbt publishLocal  # publishes com.lab:dualpool_2.13:0.1.0-SNAPSHOT to ~/.ivy2/local
-```
-
-If sbt hangs on `waiting for lock on ~/.sbt/boot/sbt.boot.lock`, another sbt instance holds the boot lock.
-Close it, or pass `-Dsbt.boot.lock=false`.
-
-Cross-building: `crossScalaVersions` lists 2.13.18 and 3.3.8, but only **2.13 has been built**. Scala 3 artifacts
-could not be resolved in the environment used to write this. Run `sbt +compile` where they are available.
-
-## Use it from a service
-
-Add the dependency (the `%%` picks `dualpool_2.13`):
+## Install
 
 ```scala
 libraryDependencies += "com.lab" %% "dualpool" % "0.1.0-SNAPSHOT"
 ```
 
-Add the optional `readDb` section next to the existing `db` section. If it is absent, reads use `db`.
+Needs Scala 2.13 and a JDK 11 or newer (HikariCP 7.1 will not load on 8).
 
-```hocon
-readDb {
-  url = ${db.url}        # same primary (pure isolation) or a read replica
-  numThreads = 10
-  maxConnections = 10
-  queueSize = 200
-  connectionTimeout = 2s
-  readOnly = true        # optional, default false: writes on this pool fail fast
+To build it locally:
+
+```bash
+sbt test          # 23 tests, including fault injection against an in-memory HSQLDB
+sbt publishLocal  # com.lab:dualpool_2.13:0.1.0-SNAPSHOT to ~/.ivy2/local
+```
+
+---
+
+## Use it
+
+### 1. Build the pools at startup
+
+```scala
+import com.lab.dualpool.DualPool
+import slick.jdbc.PostgresProfile
+
+val pools = DualPool.fromConfig(PostgresProfile, config)   // service startup hook
+...
+pools.close()                                              // service shutdown hook
+```
+
+Nothing is created until `fromConfig` is called, and nothing is cleaned up unless you `close()`. Both belong in
+the service's own lifecycle hooks, not in a field initializer.
+
+### 2. Point your DAOs at the right pool
+
+```scala
+class CustomerDao(pools: DualPool) {
+  def find(id: Long)  = pools.readDb.run(customers.filter(_.id === id).result)   // read pool
+  def save(c: Customer) = pools.writeDb.run(customers.insertOrUpdate(c))         // write pool
 }
 ```
 
-Each pool's HikariCP `poolName` is required and must be unique (proposal 5.5). `readOnly` is an addition
-to the proposal's convention: keep it off unless the DAOs on that pool are confirmed pure reads.
+| Accessor | Pool | Falls back to |
+|---|---|---|
+| `writeDb` | `db` section | — |
+| `readDb` | `readDb` section | `writeDb` when `readDb` is absent or disabled |
+| `backgroundDb` | `jobDb` section | `writeDb` when `jobDb` is absent |
 
-Services that already own a write pool keep it and add only the read pool:
+Migrate one DAO at a time. Anything you have not touched keeps using `writeDb`.
 
-```scala
-val dualPool = DualPool.adoptingWritePool(profile, existingDb, DualPoolConfig.load(config))
-val readDb   = dualPool.readDb   // == existingDb when readDb is not configured
+### 3. Configure
+
+Add a `readDb` section next to the `db` section you already have:
+
+```hocon
+readDb {
+  enabled = false        # flip per environment; off means reads stay on `db`
+  poolName = "ServiceReadDS"
+  url = ${db.url}        # the same database (isolation only), or a read replica
+  maxConnections = 3     # numThreads is set to match
+  queueSize = 200
+  connectionTimeout = 2s
+  readOnly = false       # true makes a write on this pool fail fast
+}
+
+dualpool {
+  instances = 6                  # pods, for the startup sizing check
+  databaseConnectionLimit = 100   # the database's max_connections
+}
 ```
 
-Greenfield services can use `DualPool.fromConfig(profile, config)` to build both pools.
-Then point read-only DAOs at `readDb` and leave everything else on `db`.
+`readDb` inherits `url`, `driver`, `username`, `password` and `validationQuery` from `db` when it does not set
+them, so pointing it at the same database is a three-line change. Sizing keys are never inherited — a read pool
+that silently copied the write pool's size would double the service's connection count without anyone choosing
+that.
 
-## API (proposal section 4.2)
+Defaults for every key live in [`reference.conf`](src/main/resources/reference.conf). The legacy spellings
+`maxPoolSize`, `initialPoolSize`, `acquireConnectionTimeout`, `idleConnectionTestPeriod`, `preferredTestQuery`,
+`driverClassName` and `user` are accepted too, so an existing `db` section parses unchanged.
 
-| Responsibility | Type / method |
+### Already have a write pool?
+
+Keep it. dualpool builds only the read pool and leaves yours alone — it is never reconfigured and never closed:
+
+```scala
+val pools = DualPool.adoptingWritePool(
+  profile, existingDb, DualPoolConfig.load(config),
+  adoptedWriteDataSource   = Some(existingHikariDataSource),  // optional: lets the write pool report too
+  adoptedWriteExecutorName = Some("AsyncExecutor.default"))   // optional: and report its queue depth
+
+val readDb = pools.readDb   // == existingDb while readDb is absent or disabled
+```
+
+Passing the DataSource and executor name changes nothing about how your pool behaves; it only means both pools
+show up on the same dashboard, which is what makes them comparable. To report refused work for your pool as
+well, wrap its executor with `DualPool.countingRejections(executor, counter)` and pass the same counter as
+`adoptedWriteRejections`.
+
+---
+
+## What you get on a dashboard
+
+Every metric carries a `pool="<poolName>"` label, so read and write are the same panel split by one label.
+
+| Metric | From |
 |---|---|
-| Config convention | `DualPoolConfig.load`, `PoolConfig`, `reference.conf` defaults |
-| Startup safety | `PoolConfigValidator.validate` / `validateOrFail` |
-| Pool construction | `DualPool.apply` / `fromConfig` / `adoptingWritePool`, internal `PoolFactory` |
-| Lifecycle | `DualPool.close()` (explicit, no field-initializer side effects) |
-| Observability | `PoolMetricsRegistry.register` / `verifyRegistered` / `snapshot`, `PoolMetrics` |
-| Optional job pool | `DatabaseRole.Background`, `backgroundDb` (`jobDb` section) |
+| `slick_executor_queue_size` | dualpool — **the saturation signal to alert on** |
+| `slick_executor_queue_capacity`, `slick_executor_active_threads`, `slick_executor_rejected_total` | dualpool |
+| `dualpool_connection_acquired_seconds` | dualpool — a histogram, so a p95 can be computed across pods |
+| `hikaricp_active_connections`, `hikaricp_idle_connections`, `hikaricp_pending_threads`, `hikaricp_connections` | HikariCP |
+| `hikaricp_connection_acquired_nanos`, `hikaricp_connection_timeout_total` | HikariCP |
 
-`executorDecorator` lets a service wrap each executor.
+Alert on queue depth and acquire time. `hikaricp_pending_threads` reads zero while the executor queue is deep,
+because work waits for a thread before it ever asks for a connection.
 
-## Tests to implement (proposal sections 5.5 and 7.2)
+Metrics are registered when a pool is built, not on its first query, so a pool nobody has used yet still
+reports — a metric that is simply absent reads as healthy.
 
-`src/test/scala/com/lab/dualpool/` holds pending tests for: identical metric set per pool,
-registration of a pool that has not yet served a query, write saturation not affecting the read pool,
-read fallback when `readDb` is absent, and sizing validation.
+`io.prometheus:simpleclient` is a `Provided` dependency. Without it the pools still work and
+`PoolMetricsRegistry.default` falls back to a no-op that logs a warning. With it, pass your own registry:
 
+```scala
+DualPool(profile, config, metricsRegistry = PrometheusPoolMetricsRegistry.forRegistry(registry))
+```
+
+Use `forRegistry` rather than constructing a registry yourself: a Prometheus registry accepts a given collector
+only once, so a second instance would silently report nothing.
+
+---
+
+## Safety checks at startup
+
+`DualPool.apply` refuses to start on a configuration that cannot work, rather than failing on a user's request:
+
+- pool names are present and unique, or metrics and executor MBeans would be conflated;
+- `numThreads == maxConnections`, since surplus threads block inside Slick waiting for a connection and hide
+  saturation from the queue metric;
+- `queueSize > 0`, so overload is rejected rather than accumulated;
+- `instances * sum(maxConnections)` fits `databaseConnectionLimit` (a warning above 80% of it);
+- every pool answers its validation query, which proves the credentials, the executor's threads and the MBean
+  behind `slick_executor_queue_size`.
+
+A pool you handed over with `adoptingWritePool` is warned about rather than refused, because the library did not
+build it and cannot fix it.
+
+The effective size of every pool is logged at startup, so nobody has to infer it from the config files.
+
+---
+
+## Layout
+
+```
+com/lab/dualpool/
+  DualPool.scala          the entry point: writeDb, readDb, backgroundDb, close()
+  DatabaseRole.scala      Write / Read / Background, and the config section each maps to
+  config/                 PoolConfig, DualPoolConfig (parsing), PoolConfigValidator (startup checks)
+  metrics/                the metric contract, live readings, and the Prometheus exporter
+  internal/               pool construction; not part of the public API
+```
+
+`src/test` mirrors it, with the shared HSQLDB setup in `support/`.
